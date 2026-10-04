@@ -867,6 +867,86 @@ def correntes_carga(x, p, load2_on):
     return I1_, I2_
 
 
+# Caminho rápido do modelo CC ideal. Mantê-lo separado evita que a extensão Thévenin
+# acrescente decisões e bytecode ao RHS histórico, executado milhares de vezes. O corpo
+# é deliberadamente o da v9; a v10 apenas publica as séries CC inertes após a integração.
+def _rhs_ideal(t, x, p, ev):
+    w0 = p["w0"]
+    If_, Vc = _c(x, IF), _c(x, VC)
+    breaker_closed = bool(ev.get("breaker_closed", p["rede"]))
+    Ig_ = _c(x, IG) if p["rede"] and breaker_closed else 0j
+    dv, dwv, Pf, Qf, z = x[DV], x[DW], x[PF], x[QF], x[Z]
+    I1_, I2_ = correntes_carga(x, p, ev["load2_on"])
+
+    # v9: PI dedicado.  O canal angular produz diretamente um bias em Hz; no
+    # balanço de potência ele equivale a Dp/f0 vezes esse valor.  Depois do contato
+    # os dois biases são mantidos e retirados linearmente (bumpless).
+    sync_active = bool(ev.get("sync_active", False) and not breaker_closed
+                       and p.get("estrategia_sync") == "ativo")
+    xi_p, xi_v = x[XI_SYNC_P], x[XI_SYNC_V]
+    if sync_active:
+        vg_sync = v_rede(p, delta_g_de(t, ev), ev.get("vg_mult", 1.0))
+        delta_pcc = _wrap_escalar(math.atan2(Vc.imag, Vc.real)-math.atan2(vg_sync.imag, vg_sync.real))
+        e_delta = -delta_pcc
+    else:
+        e_delta = 0.0
+    e_v = (p["vg"] - abs(Vc) / (math.sqrt(2) * p["Vph"])) if sync_active else 0.0
+    p_raw = p["KpTheta"] * e_delta + p["KiTheta"] * xi_p
+    e_raw = p["KpV"] * e_v + p["KiV"] * xi_v
+    df_bias = max(-p["DfSyncMax"], min(p["DfSyncMax"], p_raw)) if sync_active else 0.0
+    e_sync = max(-p["DeSyncMax"], min(p["DeSyncMax"], e_raw)) if sync_active else 0.0
+    dxi_p = e_delta if sync_active and (abs(p_raw) < p["DfSyncMax"] or p_raw * e_delta < 0) else 0.0
+    dxi_v = e_v if sync_active and (abs(e_raw) < p["DeSyncMax"] or e_raw * e_v < 0) else 0.0
+    meta = p.get("sync_meta", {})
+    tc = meta.get("t_fechamento_s")
+    if breaker_closed and tc is not None:
+        df_bias = rampa_retirada_sync(meta.get("df_bias_contato_hz", 0.0), t, tc,
+                                      meta.get("t_release_sync_s", 0.20))
+        e_sync = rampa_retirada_sync(meta.get("de_bias_contato_pu", 0.0), t, tc,
+                                     meta.get("t_release_sync_s", 0.20))
+    # O contrato define este canal como bias de frequência do oscilador, não como
+    # degrau de potência mecânica.  A inércia permanece no caminho VSG normal.
+    p_sync = 0.0 if p.get("estrategia_sync") == "ativo" else p["Dp"] * df_bias / p["f0"]
+
+    E = p["Eref"] - p["nq"] * (Qf - p["Qref"]) + e_sync
+    e_bruta = fem(E, dv, p)
+    e, _, _, delta_aw, lim_ativo, _, _ = _limitador(If_, Vc, e_bruta, p)
+    # Num afundamento total o ângulo da fonte externa é não observável. Suspender a
+    # correção angular nesse intervalo evita integrar uma fase arbitrária; a limitação
+    # elétrica continua ativa. Após o evento, o amortecimento de recuperação do
+    # back-calculation reduz a energia acumulada sem recortar δ_v ou Δω.
+    if ev.get("vg_mult", 1.0) <= 0.0:
+        delta_aw = 0.0
+    dIf = (e - Vc - p["Rf"] * If_) / p["Lf"] - 1j * w0 * If_
+    dI1 = ((Vc - p["RL1"] * I1_) / p["LL1"] - 1j * w0 * I1_) if p["LL1"] > 0 else 0j
+    dI2 = ((Vc - p["RL2"] * I2_) / p["LL2"] - 1j * w0 * I2_) \
+        if (ev["load2_on"] and p["LL2"] > 0) else 0j
+    dIg = derivada_corrente_rede(Vc, v_rede(p, delta_g_de(t, ev), ev.get("vg_mult", 1.0)),
+                                 Ig_, p["Rg"], p["Lg"], w0) \
+        if p["rede"] and breaker_closed else 0j
+    dVc = (If_ - I1_ - I2_ - (Ig_ if breaker_closed else 0j)) / p["Cf"] - 1j * w0 * Vc
+
+    S = 1.5 * Vc * np.conj(If_) / p["Sb"]
+    d_rec = (K_RECOVERY_FRAC * p["Kaw"] * dwv
+             if p["Imax"] > 0 and ev.get("after_event", False) else 0.0)
+    ddw = (ev["Pref"] + p_sync - Pf - p["Dp"] * dwv - p["Dw"] * (dwv - z) - d_rec) / (2 * p["H"])
+    out = np.empty(NX)
+    out[IF], out[IF + 1] = dIf.real, dIf.imag
+    out[VC], out[VC + 1] = dVc.real, dVc.imag
+    out[I1], out[I1 + 1] = dI1.real, dI1.imag
+    out[I2], out[I2 + 1] = dI2.real, dI2.imag
+    out[IG], out[IG + 1] = dIg.real, dIg.imag
+    slip_bias = p.get("severe_slip_bias_hz", 0.0) if breaker_closed else 0.0
+    out[DV] = w0 * dwv + delta_aw + 2 * math.pi * (df_bias + slip_bias)
+    out[DW] = ddw
+    out[PF] = p["wc"] * (S.real - Pf)
+    out[QF] = p["wc"] * (S.imag - Qf)
+    out[Z] = (dwv - z) / p["Tw"]
+    out[XI_SYNC_P] = dxi_p
+    out[XI_SYNC_V] = dxi_v
+    return out
+
+
 def rhs(t, x, p, ev):
     w0 = p["w0"]
     If_, Vc = _c(x, IF), _c(x, VC)
@@ -1266,14 +1346,26 @@ def simulate(p, c, x0):
         metodo = "RK45"
         T, X, PR = [], [], []
         ativos = list(range(NX)) if indices is None else list(indices)
+        n_ativos = len(ativos)
+        todos_ativos = n_ativos == NX and ativos == list(range(NX))
+        prefixo_contiguo = ativos == list(range(n_ativos))
         estado = xini[ativos].copy()
 
+        # Buffer de trabalho reutilizado entre avaliações. ``solve_ivp`` consome o
+        # retorno antes da próxima chamada, e ``rhs`` devolve um vetor independente;
+        # portanto não há aliasing. No caminho ideal comum, o acesso por fatia também
+        # evita duas indexações avançadas por avaliação.
+        completo = np.zeros(NX)
+        rhs_integracao = rhs if p["cc_ativo"] else _rhs_ideal
+
         def f_integracao(tt, xx, pp, ee):
-            if len(ativos) == NX and ativos == list(range(NX)):
-                return rhs(tt, xx, pp, ee)
-            completo = np.zeros(NX)
+            if todos_ativos:
+                return rhs_integracao(tt, xx, pp, ee)
+            if prefixo_contiguo:
+                completo[:n_ativos] = xx
+                return rhs_integracao(tt, completo, pp, ee)[:n_ativos]
             completo[ativos] = xx
-            return rhs(tt, completo, pp, ee)[ativos]
+            return rhs_integracao(tt, completo, pp, ee)[ativos]
 
         eventos = None
         if p["cc_ativo"]:

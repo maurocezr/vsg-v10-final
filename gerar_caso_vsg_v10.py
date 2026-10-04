@@ -52,6 +52,14 @@ import numpy as np
 SIMULADOR = "vsg_2a_ordem_degrau_carga_v10.py"
 EVENTOS = ("nenhum", "carga", "pref", "fase", "freq_degrau", "freq_rampa", "falta_3f", "fechamento", "sincronizacao")
 EVENTOS_FREQ = ("freq_degrau", "freq_rampa")
+OPCOES_CC_V10 = {
+    "--modelo-cc", "--c-dc-f", "--vdc-inicial-v",
+    "--permitir-desequilibrio-inicial", "--vdc-min-oper-v",
+    "--vdc-max-oper-v", "--m-max-pu", "--vdc-piso-numerico-v",
+    "--capacidade-ah", "--soc-inicial", "--r0-ohm", "--ocv-soc-pu",
+    "--ocv-v", "--soc-min-oper-pu", "--soc-max-oper-pu",
+    "--i-desc-max-a", "--i-carga-max-a",
+}
 
 
 def console_seguro():
@@ -505,6 +513,11 @@ def yq(s):
     return "'" + str(s).replace("'", "''") + "'"
 
 
+def opcao_cc_v10_explicita(argv):
+    """Indica opt-in CC explícito, aceitando ``--opção valor`` e ``--opção=valor``."""
+    return any(str(item).split("=", 1)[0] in OPCOES_CC_V10 for item in argv)
+
+
 def yaml_caso(r, a, linhas):
     v = lambda x: "null" if x is None else f"{x:.10g}"
     rede = r["modo"] == "rede"
@@ -582,7 +595,13 @@ sincronismo:
   sync_delta_max_deg: {v(a.sync_delta_max_deg)}
   sync_hold_s: {v(a.sync_hold_s)}
   breaker_delay_s: {v(a.breaker_delay_s)}
-
+"""
+    # Compatibilidade retroativa: uma chamada que usa apenas a interface v5-v9 não deve
+    # transformar o YAML gerado em um caso v10 explícito. Isso preserva inclusive o
+    # rótulo histórico ``versao: v9`` ao executar a regressão integral. As seções novas
+    # só são materializadas quando alguma opção CC da v10 foi realmente informada.
+    if getattr(a, "_emitir_cc_v10", True):
+        corpo += f"""
 lado_cc:
   modelo_cc: {yq(a.modelo_cc)}
   c_dc_f: {v(a.c_dc_f)}
@@ -603,7 +622,8 @@ bateria:
   soc_max_oper_pu: {v(a.soc_max_oper_pu)}
   i_desc_max_a: {v(a.i_desc_max_a)}
   i_carga_max_a: {v(a.i_carga_max_a)}
-
+"""
+    corpo += f"""
 evento:
   evento:   {yq(a.evento)}
   d_fase:   {v(a.d_fase)}
@@ -797,6 +817,7 @@ def main():
         if e.code not in (0, None):
             erro("argumentos inválidos (veja --help)")
         raise
+    a._emitir_cc_v10 = opcao_cc_v10_explicita(sys.argv[1:])
     if a.gerar_exemplos:
         gerar_exemplos(a.gerar_exemplos)
         return
